@@ -147,13 +147,12 @@ class Subscription:
         """
         Subscribe to an event broadcasted by the server.
         """
-        channel_layer = info.context.request.channel_layer
-        channel_layer.group_add(
-            f"chat-room-{room.id}",
-            channel_layer.channel_name,
-        )
-
-        return True
+        consumer = info.context.request
+        group_name = f"chat-room-{room.id}"
+        async for msg in consumer.wait_for_messages(group_name):
+            if msg["type"] != "chat.message":
+                raise ValueError(f"Invalid message type: {msg['type']}")
+            yield msg["message"]
 ```
 
 Look here for some much more complete examples:
