@@ -5,7 +5,8 @@ It's a simple "SubProtocolRouter" that selects the websocket subprotocol based
 on preferences and client support. Then it hands off to the appropriate consumer.
 """
 from datetime import timedelta
-from typing import Any, Optional, Sequence, Union
+import functools
+from typing import Any, Optional, Sequence, Union, List
 
 from django.http import HttpRequest, HttpResponse
 from django.urls import re_path
@@ -14,7 +15,11 @@ from channels.generic.websocket import (
     AsyncJsonWebsocketConsumer,
     AsyncWebsocketConsumer,
 )
+from channels.layers import get_channel_layer
+from channels.exceptions import StopConsumer
 from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.utils import await_many_dispatch
+from asgiref.sync import async_to_sync
 from strawberry.http import GraphQLHTTPResponse, process_result
 from strawberry.schema import BaseSchema
 from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
@@ -73,6 +78,41 @@ class GraphQLWSConsumer(AsyncJsonWebsocketConsumer):
         self.protocols = subscription_protocols
 
         super().__init__()
+
+    async def __call__(self, scope, receive, send):
+        """
+        Dispatches incoming messages to type-based handlers asynchronously.
+        """
+        self.scope = scope
+
+        # Initialize channel layer
+        self.channel_layer = get_channel_layer(self.channel_layer_alias)
+        if self.channel_layer is not None:
+            self.channel_name = await self.channel_layer.new_channel()
+            self.channel_receive = functools.partial(
+                self.channel_layer.receive, self.channel_name
+            )
+        # Store send function
+        if self._sync:
+            self.base_send = async_to_sync(send)
+        else:
+            self.base_send = send
+        # Pass messages in from channel layer or client to dispatch method
+        try:
+            # NOTE: This is what's been removed from the base class. Messages from the
+            # channel layer shouldn't even try to be received by the consumer, because
+            # control will have been handed off to the Strawberry subscription function,
+            # as such control flow will never return to the `await_many_dispatch` until
+            # the consumer is being closed.
+            # if self.channel_layer is not None:
+            #     await await_many_dispatch(
+            #         [receive, self.channel_receive], self.dispatch
+            #     )
+            # else:
+            await await_many_dispatch([receive], self.dispatch)
+        except StopConsumer:
+            # Exit cleanly
+            pass
 
     def pick_preferred_protocol(
         self, accepted_subprotocols: Sequence[str]
@@ -142,6 +182,28 @@ class GraphQLWSConsumer(AsyncJsonWebsocketConsumer):
         consumer: AsyncWebsocketConsumer = None,
     ) -> GraphQLHTTPResponse:
         return process_result(result)
+
+    async def wait_for_messages(self, groups: Union[str, List[str]]):
+        """Consume messages delivered to specified groups."""
+        if isinstance(groups, str):
+            groups = [groups]
+        for group in groups:
+            await self.channel_layer.group_add(group, self.channel_name)
+        try:
+            while True:
+                yield (await self.channel_receive())
+        except StopConsumer:
+            pass
+        finally:
+            for group in groups:
+                await self.channel_layer.group_discard(group, self.channel_name)
+
+    async def send_message(self, groups: Union[str, List[str]], message):
+        """Send a message to specified groups."""
+        if isinstance(groups, str):
+            groups = [groups]
+        for group in groups:
+            await self.channel_layer.group_send(group, message)
 
 
 class GraphQLProtocolTypeRouter(ProtocolTypeRouter):
